@@ -1,200 +1,194 @@
-# metaprompt
-Project: “Fix GPT-5” — a mixture-of-agents orchestrator that turns a single user prompt into better results via summarization, parallel candidates, judging, refinement, and verification.
-Form factor: One file, CLI, zero setup besides requests (and either OpenAI key or Ollama for local).
-Goal: Minimize chat time → maximize runnable MVP + artifacts you can test.
+# Fix GPT-5
+A mixture-of-agents orchestrator that treats GPT-5 as a system, not a single LLM.
 
-Core Thesis
+## TL;DR
+Pipeline: summarize → 5×candidates → judge → refine → final → verify (+optional repair)
+Providers: OpenAI (cloud), Ollama (local), offline stub
+Artifacts: everything logged to runs/<timestamp>/
 
-Treat “GPT-5” as a system (several models + roles), not a single LLM.
+## Quickstart
 
-Pipeline: nano → 5 candidates → judge → nano prompt-refine → final solution → nano verify (optional repair loop).
+OpenAI (cloud):
+export OPENAI_API_KEY=sk-...
+python fixgpt5.py --op run --provider openai
+--model "gpt-5" --nano "gpt-5-nano"
+--prompt "Implement a fast LRU cache in Python with tests"
 
-Always log everything for auditability and quick iteration.
+Ollama (local):
+ollama pull qwen2.5:3b qwen2.5:1.5b
+python fixgpt5.py --op run --provider ollama
+--model "qwen2.5:3b" --nano "qwen2.5:1.5b"
+--prompt "Design a sleep hygiene plan for teens"
 
-MVP (already provided as fixgpt5.py)
-
-Providers: openai or ollama (auto-detect; falls back to a deterministic offline stub).
-
-Models: main (gpt-5 or qwen2.5:3b) + nano (gpt-5-nano or qwen2.5:1.5b).
-
-Ops: --op run | selftest | demo
-
-Artifacts (per run, in runs/TS/):
-
-prompt.txt, summary.txt, candidates.json, judge.json, refined_prompt.txt, final_solution.md, verify.json, run.json
-
-Verification: Nano model returns JSON {verdict: PASS|FAIL, reasons, must_fix, nice_to_have}. If FAIL, one repair loop can re-call the main model with must-fixes.
-
-Pipeline (exact steps)
-
-Summarize (nano): compress user prompt into a tight brief.
-
-Generate 5 candidates (main, parallel): styles = Pragmatic, Performance, Security/Privacy, Research, Product.
-
-Judge (main): rank + JSON feedback (schema enforced).
-
-Refine prompt (nano): produce a mega-prompt with intent, constraints, plan, I/O, acceptance tests, and “What NOT to do”.
-
-Final solution (main): produce Markdown-only deliverable.
-
-Verify (nano): PASS/FAIL. If FAIL → optional patch round with must-fix list.
-
-Usage
-
-OpenAI: set OPENAI_API_KEY
-
-python fixgpt5.py --op run --provider openai --model "gpt-5" --nano "gpt-5-nano" --prompt "Implement a fast LRU cache in Python with tests"
-
-Ollama local:
-
-ollama pull qwen2.5:3b && ollama pull qwen2.5:1.5b
-
-python fixgpt5.py --op run --provider ollama --model "qwen2.5:3b" --nano "qwen2.5:1.5b" --prompt "Design a sleep hygiene plan for teens"
-
-Smoke tests:
-
+## Smoke tests / demo:
 python fixgpt5.py --op selftest
-
 python fixgpt5.py --op demo
 
-Constraints / Non-goals (for now)
+## Artifacts (per run):
+prompt.txt, summary.txt, candidates.json, judge.json, refined_prompt.txt, final_solution.md, verify.json, run.json
 
-Single-file script; no DB, no web UI, no streaming.
+## How Meta-Prompting Works (inside the orchestrator)
 
-JSON parsing is resilient via a sanitizer; if judge/verifier returns non-JSON, we fallback gracefully.
+Roles & sequence:
 
-Production features (auth, telemetry, sandboxing) are out of scope for MVP.
+Summarizer (nano): compresses the user prompt for lossless intent.
 
-Extension hooks (when ready)
+Candidate generators (main, 5 styles in parallel): Pragmatic, Performance, Security/Privacy, Research, Product.
 
-Add --op gui (Tkinter) for toggles + live logs.
+Judge (main): ranks candidates and emits structured feedback (JSON).
 
-Pluggable candidate style list; change or add roles.
+Refiner (nano): builds a “mega-prompt” that fuses user intent + best candidate + judge feedback.
 
-Add retry/backoff and per-stage timeouts.
+Final (main): produces the deliverable (Markdown).
 
-Swap verification for unit tests (execute snippets in a sandbox).
+Verifier (nano): returns a strict PASS/FAIL + fix-lists; optional repair loop re-runs steps 5–6 using must-fix items.
 
-Step-By-Step: Learn & Code This Yourself
+## Why XML-style tags in prompts?
 
-The target is one file that actually runs and outputs artifacts. You’ll build it in layers.
+We delimit prompt sections with lightweight XML-style tags (e.g., <task>…</task>, <constraints>…</constraints>) so the model cleanly separates instructions, context, and schema. This improves parsing reliability for multi-part prompts and complex constraints. Guidance from Anthropic and OpenAI recommends tags/prefixes to structure prompts when multiple components are present.
 
-0) Prep (5 min)
+Example (refiner’s meta-prompt skeleton):
 
-python -V (3.9+), pip install requests
+<role>Refiner</role>
+<objective>Fuse user intent, top candidate, and judge feedback into a single executable plan.</objective>
 
-Optional: brew install ollama && ollama serve (then ollama pull qwen2.5:3b qwen2.5:1.5b)
+<context> <user_intent>{{USER_PROMPT}}</user_intent> <best_candidate>{{CANDIDATE_MD}}</best_candidate> <judge_feedback>{{JUDGE_JSON}}</judge_feedback> </context> <constraints> <style>Concise, testable, production-minded</style> <non_goals>Do not add external deps beyond 'requests'</non_goals> </constraints> <deliverable> <format>markdown</format> <sections>Overview, Plan, Steps, Tests, Risks</sections> </deliverable>
 
-Create a folder; save the single file as fixgpt5.py
+<output_schema format="json">{"type":"object","properties":{"plan":{"type":"string"},"tests":{"type":"array","items":{"type":"string"}}},"required":["plan","tests"]}</output_schema>
 
-1) Skeleton & CLI
+## I/O Format Choice: XML vs JSON (and what we use)
 
-Start with argparse flags:
+Prompts (inputs to the model): XML-style delimiter tags to segment parts of the instruction/context. This improves comprehension and reduces prompt-parsing errors without requiring full XML tooling.
+Model outputs (machine-readable): JSON with a JSON Schema and strict Structured Outputs when available (OpenAI / Azure AOAI), or “tool” schemas on Anthropic—this yields parse-safe, contract-enforced responses ideal for automation.
 
---op (run|selftest|demo)
+Why not full XML everywhere?
 
---provider (auto|openai|ollama)
+Verbosity: JSON is generally less verbose than XML for the same structure, which matters because LLM cost and context usage scale with token count.
 
---model, --nano, --timeout, --temperature, --candidates, --max-loops, --prompt
+Ecosystem & enforcement: Modern LLM stacks provide first-class JSON guarantees (e.g., OpenAI Structured Outputs). XML lacks equivalent, widely supported schema enforcement in current LLM APIs.
 
-Add helpers: timestamp, mkdirp, write_text, write_json.
+“Is JSON expensive?” Token cost ≈ bytes/structure. JSON is still usually smaller than XML, so if the alternative is XML, JSON typically saves tokens. Use tokenizer benchmarks to check.
 
-Checkpoint: running python fixgpt5.py --op demo creates a runs/<TS>/ directory with basic files.
+Ultra-lean alternatives: For extreme token budgets, some engineers use TSV/CSV or minimal key:value lines; this can reduce tokens, but you lose schema validation and robustness—benchmark before switching.
 
-2) LLM Client Abstraction
+Practical guidance:
 
-Build a single LLMClient.chat() that:
+Prefer JSON + JSON Schema for any output that your code will parse.
 
-routes to OpenAI (chat completions) or Ollama (/api/chat),
+Use XML-style tags (or clear prefixes) inside prompts to mark sections: <task>, <constraints>, <context>, <examples>, <output_schema>. This is for model reading, not for your parser.
 
-returns string,
+Benchmark tokens on your real prompts. Tiny syntax changes can move costs substantially.
 
-never raises (fallback to deterministic stub).
+## Schemas enforced
 
-Add nano() and main() convenience wrappers.
+Judge output (stored in judge.json):
+{
+"type": "object",
+"properties": {
+"ranked": {
+"type": "array",
+"items": {
+"type": "object",
+"properties": {
+"id": {"type": "string"},
+"score": {"type": "number"},
+"reasons": {"type": "string"}
+},
+"required": ["id", "score", "reasons"]
+}
+},
+"must_fix": {"type": "array", "items": {"type": "string"}},
+"nice_to_have": {"type": "array", "items": {"type": "string"}}
+},
+"required": ["ranked", "must_fix"]
+}
 
-Checkpoint: try ollama provider with tiny models; ensure you get a response (or stub if down).
+Verifier output (stored in verify.json):
+{
+"type": "object",
+"properties": {
+"verdict": {"enum": ["PASS", "FAIL"]},
+"reasons": {"type": "string"},
+"must_fix": {"type": "array", "items": {"type": "string"}},
+"nice_to_have": {"type": "array", "items": {"type": "string"}}
+},
+"required": ["verdict"]
+}
 
-3) Prompts & Roles
+## Token-Efficiency Tips
 
-Define the 5 system prompts already specified:
+Keep tag names and keys short: <task>, not <primary_user_instruction_block>.
 
-SUMMARIZER_SYS, CANDIDATE_SYS, JUDGE_SYS (JSON schema), REFINER_SYS, VERIFIER_SYS.
+Avoid redundant nesting or repeated keys in outputs.
 
-Define CANDIDATE_STYLES list (IDs + style descriptions).
+Put long evidence/context under one tag and reference by ID when possible.
 
-Checkpoint: --op selftest should run end-to-end and write all artifacts.
+Measure before/after with tokenizer; don’t guess.
 
-4) Orchestrator.run()
+Ops
+--op run # full pipeline
+--op selftest # offline stub checks
+--op demo # canned example
 
-Implement the 6 stages in order (each writes to disk):
+Constraints / Non-Goals (current)
 
-summary.txt via nano.
+Single-file script; no DB, no web UI, no streaming
 
-candidates.json via parallel threads → 5 markdown solutions.
+JSON parsing hardened (sanitizer + schema)
 
-judge.json (ensure valid JSON via sanitizer/fallback).
+Production features (auth, sandboxing, telemetry) are out of scope
 
-refined_prompt.txt (nano mega-prompt).
+Extension Hooks (future)
 
-final_solution.md (main model).
+--op gui (Tk) with toggles + live logs
 
-verify.json (nano). If FAIL and --max-loops > 0, apply must-fix patch round and re-run step 5→6.
+Retry/backoff & per-stage timeouts
 
-Checkpoint: final_solution.md is non-empty; verify.json.verdict exists.
+Pluggable candidate style list
 
-5) Logging & Scoreboard
+Swap verifier for unit-test sandbox
 
-Print a short console digest:
+## Instructions for ChatGPT to Help Daley Coding
 
-Rankings from judge
+Role: Teacher, not SWE.
+Style: Fast, concise, high-signal.
 
-Judge overall feedback
+Do:
 
-Verifier JSON + number of patch rounds
+Give architecture guidance (layout, APIs, design patterns).
 
-Checkpoint: You can scan console + artifacts quickly after each run.
+Provide annotated Jupyter-style snippets only when essential.
 
-6) Quick Test Plan (no external libs)
+Supply JSON schemas, prompt templates, test checklists.
 
-File existence: assert all artifact paths exist after --op selftest.
+Link official docs (OpenAI, Ollama).
 
-JSON well-formed: load judge.json, verify.json.
+Don’t:
 
-Deterministic fallback: simulate missing API / stopped Ollama; confirm stub still writes all outputs.
+Dump full code files.
 
-Run:
+Add GUIs, DBs, or deps beyond requests.
 
-python fixgpt5.py --op selftest
-python fixgpt5.py --op run --prompt "Build a CLI todo app in Python"
+Hide JSON in prose.
 
-Acceptance Criteria (MVP is “done” when…)
+Deliverables per reply:
 
-python fixgpt5.py --op selftest succeeds and produces:
+Sectioned notes (short bullets).
 
-prompt.txt, summary.txt, candidates.json, judge.json, refined_prompt.txt, final_solution.md, verify.json, run.json.
+Tiny code cells only when unavoidable.
 
-verify.json.verdict is "PASS" or "FAIL" with reasons (never empty/invalid).
+Clear action checklist.
 
-No crash even without internet or model servers (stub kicks in).
+## Sources / Further Reading
 
-One file, one command to use.
+Structured Outputs (JSON Schema guarantees) — OpenAI docs.
 
-Minimal “Cheat Sheet” You Can Paste Anywhere
+Azure AOAI: Structured outputs (JSON Schema) — recommended for multi-step workflows.
 
-How to run (local models):
+Prompt structuring with XML-style tags — Anthropic & Google Vertex guidance; OpenAI prompt engineering.
 
-ollama pull qwen2.5:3b
-ollama pull qwen2.5:1.5b
-python fixgpt5.py --op run --provider ollama --model "qwen2.5:3b" --nano "qwen2.5:1.5b" --prompt "Generate a Python LRU cache with tests"
+Token counting — OpenAI tokenizer & tiktoken cookbook.
 
+JSON vs XML verbosity — JWT vs SAML (Auth0) and academic comparison.
 
-How to run (OpenAI):
-
-export OPENAI_API_KEY=sk-...
-python fixgpt5.py --op run --provider openai --model "gpt-5" --nano "gpt-5-nano" --prompt "Draft a product spec for a focus timer app"
-
-
-Artifacts appear in: runs/YYYYMMDD_HHMMSS/
-
-If you want, next step I can fold in a tiny --op gui (same file) with Start/Stop + toggles (models, candidates, auto-patch) and live log pane—say the word and I’ll drop it in.
+TSV vs JSON anecdotal token cost — treat as workload-specific, benchmark.
